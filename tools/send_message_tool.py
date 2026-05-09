@@ -42,6 +42,25 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".3gp"}
 _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 _VOICE_EXTS = {".ogg", ".opus"}
+_BUILTIN_SEND_PLATFORMS = frozenset({
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp",
+    "signal",
+    "email",
+    "sms",
+    "mattermost",
+    "matrix",
+    "homeassistant",
+    "dingtalk",
+    "feishu",
+    "wecom",
+    "bluebubbles",
+    "qqbot",
+    "yuanbao",
+    "weixin",
+})
 # Telegram's Bot API sendAudio only accepts MP3 / M4A. Other audio
 # formats either route through sendVoice (Opus/OGG) or fall back to
 # document delivery.
@@ -415,22 +434,75 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-async def _send_via_adapter(platform, pconfig, chat_id, chunk):
+def _send_result_ok(result) -> bool:
+    if isinstance(result, dict):
+        return bool(result.get("success"))
+    return bool(getattr(result, "success", False))
+
+
+def _send_result_error(result) -> str:
+    if isinstance(result, dict):
+        return str(result.get("error") or "unknown error")
+    return str(getattr(result, "error", None) or "unknown error")
+
+
+def _send_result_message_id(result):
+    if isinstance(result, dict):
+        return result.get("message_id")
+    return getattr(result, "message_id", None)
+
+
+async def _send_adapter_media(adapter, chat_id, media_path, is_voice, metadata=None):
+    if not os.path.exists(media_path):
+        return {"error": f"Media file not found: {media_path}"}
+
+    ext = os.path.splitext(media_path)[1].lower()
+    if ext in _IMAGE_EXTS and hasattr(adapter, "send_image_file"):
+        return await adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+    if ext in _VIDEO_EXTS and hasattr(adapter, "send_video"):
+        return await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+    if (is_voice or ext in _AUDIO_EXTS) and hasattr(adapter, "send_voice"):
+        return await adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+    if hasattr(adapter, "send_document"):
+        return await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+    adapter_name = getattr(adapter, "name", "plugin")
+    return {"error": f"Adapter for platform '{adapter_name}' does not support native media delivery"}
+
+
+async def _send_via_adapter(platform, pconfig, chat_id, chunk, media_files=None, thread_id=None):
     """Send a message via a live gateway adapter (for plugin platforms).
 
     Falls back to error if no adapter is connected for this platform.
     """
+    media_files = media_files or []
     try:
         from gateway.run import _gateway_runner_ref
         runner = _gateway_runner_ref()
         if runner:
             adapter = runner.adapters.get(platform)
             if adapter:
-                from gateway.platforms.base import SendResult
-                result = await adapter.send(chat_id=chat_id, content=chunk)
-                if result.success:
-                    return {"success": True, "message_id": result.message_id}
-                return {"error": f"Adapter send failed: {result.error}"}
+                metadata = {"thread_id": thread_id} if thread_id else None
+                last_result = None
+                if chunk.strip():
+                    result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                    if not _send_result_ok(result):
+                        return {"error": f"Adapter send failed: {_send_result_error(result)}"}
+                    last_result = result
+
+                for media_path, is_voice in media_files:
+                    result = await _send_adapter_media(adapter, chat_id, media_path, is_voice, metadata=metadata)
+                    if not _send_result_ok(result):
+                        return {"error": f"Adapter media send failed: {_send_result_error(result)}"}
+                    last_result = result
+
+                if last_result is None:
+                    return {"error": "No deliverable text or media remained after processing MEDIA tags"}
+                return {
+                    "success": True,
+                    "platform": platform.value,
+                    "chat_id": chat_id,
+                    "message_id": _send_result_message_id(last_result),
+                }
     except Exception as e:
         return {"error": f"Plugin platform send failed: {e}"}
     return {"error": f"No live adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
@@ -582,6 +654,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else None,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # --- Plugin platforms: use the running adapter so native media uploads work ---
+    if media_files and platform.value not in _BUILTIN_SEND_PLATFORMS:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+                thread_id=thread_id,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result

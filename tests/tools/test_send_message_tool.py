@@ -598,6 +598,97 @@ class TestSendToPlatformChunking:
             ("disconnect",),
         ]
 
+    def test_plugin_platform_media_only_uses_live_adapter_document(self, tmp_path):
+        file_path = tmp_path / "report.pdf"
+        file_path.write_bytes(b"%PDF-1.4 test")
+        platform = Platform("irc")
+
+        adapter = SimpleNamespace(
+            name="ANI",
+            send=AsyncMock(),
+            send_document=AsyncMock(return_value=SimpleNamespace(success=True, message_id="file-1")),
+        )
+        runner = SimpleNamespace(adapters={platform: adapter})
+
+        with patch("gateway.run._gateway_runner_ref", return_value=runner):
+            result = asyncio.run(
+                _send_to_platform(
+                    platform,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "123",
+                    "",
+                    media_files=[(str(file_path), False)],
+                )
+            )
+
+        assert result["success"] is True
+        assert result["platform"] == "irc"
+        assert result["message_id"] == "file-1"
+        adapter.send.assert_not_awaited()
+        adapter.send_document.assert_awaited_once_with(
+            chat_id="123",
+            file_path=str(file_path),
+            metadata=None,
+        )
+
+    def test_plugin_platform_text_and_media_uses_live_adapter(self, tmp_path):
+        file_path = tmp_path / "report.md"
+        file_path.write_text("# report")
+        platform = Platform("irc")
+
+        adapter = SimpleNamespace(
+            name="ANI",
+            send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-1")),
+            send_document=AsyncMock(return_value=SimpleNamespace(success=True, message_id="file-1")),
+        )
+        runner = SimpleNamespace(adapters={platform: adapter})
+
+        with patch("gateway.run._gateway_runner_ref", return_value=runner):
+            result = asyncio.run(
+                _send_to_platform(
+                    platform,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "123",
+                    "report attached",
+                    media_files=[(str(file_path), False)],
+                    thread_id="thread-1",
+                )
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "file-1"
+        adapter.send.assert_awaited_once_with(
+            chat_id="123",
+            content="report attached",
+            metadata={"thread_id": "thread-1"},
+        )
+        adapter.send_document.assert_awaited_once_with(
+            chat_id="123",
+            file_path=str(file_path),
+            metadata={"thread_id": "thread-1"},
+        )
+
+    def test_plugin_platform_missing_media_returns_specific_error(self, tmp_path):
+        platform = Platform("irc")
+        missing = tmp_path / "missing.pdf"
+        adapter = SimpleNamespace(name="ANI", send_document=AsyncMock())
+        runner = SimpleNamespace(adapters={platform: adapter})
+
+        with patch("gateway.run._gateway_runner_ref", return_value=runner):
+            result = asyncio.run(
+                _send_to_platform(
+                    platform,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "123",
+                    "",
+                    media_files=[(str(missing), False)],
+                )
+            )
+
+        assert "Media file not found" in result["error"]
+        assert "had only media attachments" not in result["error"]
+        adapter.send_document.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # HTML auto-detection in Telegram send
